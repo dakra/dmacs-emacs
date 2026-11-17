@@ -59,6 +59,7 @@ typedef NS_ENUM(NSUInteger, MtlCursorMode) {
   MTL_CURSOR_PIXIEDUST= 5,  /* Radial particle burst */
   MTL_CURSOR_HOLLOW   = 6,  /* Hollow box (outline only) */
   MTL_CURSOR_BEAM     = 7,  /* Thin vertical bar */
+  MTL_CURSOR_SMEAR    = 8,  /* Cursor smears from its old cell to the new */
 };
 
 typedef NS_ENUM(NSUInteger, MtlScrollEasing) {
@@ -105,6 +106,9 @@ typedef struct mtl_spring {
   float trailAge[MTL_TRAIL_LEN];
   /* Particles (pixiedust, sonicboom, ripple) */
   MtlParticle particles[MTL_MAX_PARTICLES];
+  /* Smear mode: the four animated corners (TL, TR, BR, BL) and the time
+     constant each one approaches its target corner with.  */
+  float smearX[4], smearY[4], smearTau[4];
 }
 
 @property (nonatomic, assign) struct frame *emacsFrame;
@@ -119,6 +123,9 @@ typedef struct mtl_spring {
 @property (nonatomic, assign) BOOL cursorDirty;
 /* Blink-off phase: hide the cursor body (trails/particles keep animating). */
 @property (nonatomic, assign) BOOL cursorHidden;
+
+/* Smear mode: corners not yet settled on the cursor cell.  */
+@property (nonatomic, assign) BOOL smearActive;
 
 /* Trail history (torpedo mode) */
 @property (nonatomic, assign) NSUInteger trailHead;
@@ -153,6 +160,9 @@ typedef struct mtl_spring {
 /* One animation step + composite, drivable from a Lisp timer (the display
    link starves while Emacs idles). */
 - (void)tickWithDt:(float)dt;
+
+/* Retarget the smear-mode corners on a new cursor cell.  */
+- (void)smearToX:(float)x y:(float)y width:(float)w height:(float)h;
 
 /* Spawn particles at cursor for pixiedust/sonicboom/ripple modes */
 - (void)spawnParticlesAtX:(float)x y:(float)y;
@@ -316,6 +326,7 @@ extern MtlCursorMode   g_mtl_cursor_mode;
 extern MtlScrollEasing g_mtl_scroll_easing;
 extern float           g_mtl_scroll_duration; /* seconds, default 0.15 */
 extern NSUInteger      g_mtl_trail_len;        /* default 20 */
+extern float           g_mtl_smear_duration;   /* default 0.12 */
 extern BOOL            g_mtl_animations_enabled; /* default NO (animations are opt-in) */
 extern BOOL            g_mtl_vsync_enabled;       /* default YES (60fps power cap) */
 extern BOOL            g_mtl_cursor_suppress_effects; /* set per-command: skip
