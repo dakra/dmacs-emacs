@@ -167,6 +167,8 @@ ns_load_image (struct frame *f, struct image *img,
   if (STRINGP (spec_file))
     {
       eImg = [EmacsImage allocInitFromFile: spec_file];
+      /* AppKit retains named images.  */
+      [eImg setName: nil];
     }
   else if (STRINGP (spec_data))
     {
