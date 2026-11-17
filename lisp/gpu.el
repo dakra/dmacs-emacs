@@ -86,6 +86,7 @@
     ('pixiedust 5)
     ('hollow   6)
     ('beam     7)
+    ('smear    8)
     (_ 1)))
 
 (defun gpu--scroll-easing-number (easing)
@@ -156,7 +157,7 @@ back to 30Hz when the fade ends (see `gpu--pump')."
 
 (defun gpu--pump ()
   "Advance every continuous GPU animation one step.
-Re-paces the timer to 60Hz while a cross-fade runs and back to 30Hz
+Re-paces the timer to 60Hz while a cross-fade or cursor smear runs and back to 30Hz
 otherwise; cancels it once nothing needs pumping."
   (gpu--video-follow)
   (let ((mask 0))
@@ -166,7 +167,7 @@ otherwise; cancels it once nothing needs pumping."
       (setq gpu--pump-fade-frame nil))
     (if (zerop mask)
         (gpu--pump-stop)
-      (let ((want (if (zerop (logand mask 2)) 0.033 0.016)))
+      (let ((want (if (zerop (logand mask 10)) 0.033 0.016)))
         (unless (eql want gpu--pump-interval)
           (gpu--pump-stop)
           (gpu--pump-start (eql want 0.016)))))))
@@ -193,7 +194,8 @@ Possible values:
   `ripple'     Three concentric expanding rings
   `pixiedust'  Radial particle burst on jump
   `hollow'     Hollow outline box
-  `beam'       Thin vertical bar"
+  `beam'       Thin vertical bar
+  `smear'      Stretches from the old cell into the new one"
   :type '(choice (const :tag "Block (static, default)" block)
                  (const :tag "Spring (smooth)" spring)
                  (const :tag "Torpedo (trail)" torpedo)
@@ -201,7 +203,8 @@ Possible values:
                  (const :tag "Ripple (3 rings)" ripple)
                  (const :tag "Pixiedust (particles)" pixiedust)
                  (const :tag "Hollow (outline)" hollow)
-                 (const :tag "Beam (bar)" beam))
+                 (const :tag "Beam (bar)" beam)
+                 (const :tag "Smear (stretch)" smear))
   :set (lambda (sym val)
          (set-default sym val)
          ;; Propagate to the live driver so the change takes effect at
@@ -232,6 +235,16 @@ Lower values are snappier; higher values are more fluid."
   "Length of the cursor trail in torpedo mode (1-40)."
   :type 'integer
   :set #'set-default
+  :group 'gpu)
+
+(defcustom gpu-cursor-smear-duration 0.12
+  "Seconds the `smear' cursor takes to contract into its new cell.
+Zero disables the smear."
+  :type 'number
+  :set (lambda (sym val)
+         (set-default sym val)
+         (when (fboundp 'gpu-smear-duration)
+           (gpu-smear-duration val)))
   :group 'gpu)
 
 (defcustom gpu-cursor-effects-while-typing nil
@@ -338,6 +351,8 @@ The NS backend still handles events, menus, and scrollbars."
           (gpu-scroll-effect (gpu--scroll-easing-number gpu-scroll-easing))
           (gpu-scroll-duration gpu-scroll-duration)
           (gpu-trail-length gpu-trail-length)
+          (when (fboundp 'gpu-smear-duration)
+            (gpu-smear-duration gpu-cursor-smear-duration))
           (gpu-animations gpu-animations-enabled)
           (when gpu-animations-enabled (gpu--pump-start))
           ;; Distinguish typing from cursor movement for the effects.
@@ -382,7 +397,8 @@ The NS backend still handles events, menus, and scrollbars."
   (interactive
    (list (intern (completing-read "Cursor mode: "
                                   '("block" "spring" "torpedo" "sonicboom"
-                                    "ripple" "pixiedust" "hollow" "beam")
+                                    "ripple" "pixiedust" "hollow" "beam"
+                                    "smear")
                                   nil t))))
   (setopt gpu-cursor-animation mode)
   (message "GPU cursor mode: %s" mode))

@@ -289,6 +289,8 @@ MtlCursorMode   g_mtl_cursor_mode    = MTL_CURSOR_SONICBOOM;
 MtlScrollEasing g_mtl_scroll_easing  = MTL_EASE_OUT_QUAD;
 float           g_mtl_scroll_duration = 0.15f;
 NSUInteger      g_mtl_trail_len       = 20;
+/* Smear mode: seconds the trailing edge takes to (nearly) catch up.  */
+float           g_mtl_smear_duration  = 0.12f;
 
 /* When false, presents do not wait for the display refresh
    (CAMetalLayer.displaySyncEnabled): redisplay never blocks on a
@@ -998,6 +1000,9 @@ mtl_video_present_due (MtlFrameData *fd)
           || self.cursorMode == MTL_CURSOR_RIPPLE))
     [self spawnParticlesAtX:self.curTargetX + w/2 y:self.curTargetY + h/2];
 
+  if (self.cursorMode == MTL_CURSOR_SMEAR)
+    [self smearToX:fx y:fy width:(float) w height:(float) h];
+
   /* Add to trail history (skipped while typing). */
   if (!g_mtl_cursor_suppress_effects
       && self.cursorMode == MTL_CURSOR_TORPEDO
@@ -1018,6 +1023,48 @@ mtl_video_present_due (MtlFrameData *fd)
   self.curTargetW = (float)w;
   self.curTargetH = (float)h;
   self.cursorDirty = YES;
+}
+
+/* Smear mode: retarget the four corners on the cell at (X, Y, W, H).
+   Corners on the leading side of the motion jump there at once, the
+   trailing ones follow over g_mtl_smear_duration, so the cursor
+   stretches from where it was and then contracts into the new cell.  */
+- (void)smearToX:(float)x y:(float)y width:(float)w height:(float)h
+{
+  static const float ux[4] = { 0, 1, 1, 0 }, uy[4] = { 0, 0, 1, 1 };
+  float ocx = 0, ocy = 0;
+  for (int i = 0; i < 4; i++)
+    {
+      ocx += smearX[i] / 4;
+      ocy += smearY[i] / 4;
+    }
+  float dx = x + w / 2 - ocx, dy = y + h / 2 - ocy;
+  float dist = sqrtf (dx * dx + dy * dy);
+  BOOL snap = (!self.smearActive && self.curTargetW == 0)
+              || g_mtl_cursor_suppress_effects
+              || g_mtl_smear_duration <= 0
+              || dist < 0.5f;
+  float tau = g_mtl_smear_duration / 3;   /* ~95% settled after duration */
+  for (int i = 0; i < 4; i++)
+    {
+      float tx = x + ux[i] * w, ty = y + uy[i] * h;
+      float dot = 0;
+      if (!snap)
+        {
+          /* Corner direction from the cell center vs. motion direction.  */
+          float cx = ux[i] - 0.5f, cy = uy[i] - 0.5f;
+          dot = (cx * dx + cy * dy) / (dist * sqrtf (cx * cx + cy * cy));
+        }
+      if (snap || dot > 0.1f)
+        {
+          smearX[i] = tx;
+          smearY[i] = ty;
+          smearTau[i] = 0;
+        }
+      else
+        smearTau[i] = tau * (0.5f + 0.5f * -dot);
+    }
+  self.smearActive = !snap;
 }
 
 - (void)beginScrollBy:(float)pixels
@@ -1100,6 +1147,32 @@ mtl_video_present_due (MtlFrameData *fd)
       self.springX = sx;
       self.springY = sy;
       if (dx > 0.5f || dy > 0.5f) needsComposite = YES;
+    }
+
+  if (self.cursorMode == MTL_CURSOR_SMEAR && self.smearActive)
+    {
+      static const float ux[4] = { 0, 1, 1, 0 }, uy[4] = { 0, 0, 1, 1 };
+      BOOL moving = NO;
+      for (int i = 0; i < 4; i++)
+        {
+          float tx = self.curTargetX + ux[i] * self.curTargetW;
+          float ty = self.curTargetY + uy[i] * self.curTargetH;
+          if (smearTau[i] > 0)
+            {
+              float k = 1.0f - expf (-dt / smearTau[i]);
+              smearX[i] += (tx - smearX[i]) * k;
+              smearY[i] += (ty - smearY[i]) * k;
+            }
+          if (fabsf (tx - smearX[i]) < 0.5f && fabsf (ty - smearY[i]) < 0.5f)
+            {
+              smearX[i] = tx;
+              smearY[i] = ty;
+            }
+          else
+            moving = YES;
+        }
+      self.smearActive = moving;
+      needsComposite = YES;     /* also presents the settled cursor */
     }
 
   /* Age the torpedo trail so it fades out smoothly on its own.  Samples are
@@ -2096,6 +2169,39 @@ mtl_batch_append (MtlFrameData *fd, float x0, float y0, float x1, float y1,
         [enc setVertexBytes:v length:sizeof(v) atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
       }
+
+      /* Smear: the stretched quad in the cursor color, then the cursor
+         cell itself re-blitted from the static texture on top, so the
+         real (inverted-glyph) cursor stays crisp inside it.  */
+      if (anim.cursorMode == MTL_CURSOR_SMEAR && anim.smearActive
+          && !anim.cursorHidden && cw > 0 && ch > 0)
+        {
+          typedef struct { float x,y,r,g,b,a; } RV;
+          float *sx = anim->smearX, *sy = anim->smearY;
+          RV v[6] = {
+            {sx[0],sy[0],ccr,ccg,ccb,1},{sx[1],sy[1],ccr,ccg,ccb,1},
+            {sx[2],sy[2],ccr,ccg,ccb,1},{sx[0],sy[0],ccr,ccg,ccb,1},
+            {sx[2],sy[2],ccr,ccg,ccb,1},{sx[3],sy[3],ccr,ccg,ccb,1},
+          };
+          [enc setRenderPipelineState:g_particle_pipeline];
+          [enc setVertexBytes:v length:sizeof(v) atIndex:0];
+          [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+
+          float W = (float) sz.width, H = (float) sz.height;
+          float u0 = cx / W, v0 = cy / H, u1 = (cx + cw) / W, v1 = (cy + ch) / H;
+          float nx0 = u0 * 2 - 1, nx1 = u1 * 2 - 1;
+          float ny0 = 1 - v0 * 2, ny1 = 1 - v1 * 2;
+          typedef struct { float x, y, u, v; } BlitVert;
+          BlitVert bv[6] = {
+            {nx0,ny1,u0,v1},{nx1,ny1,u1,v1},{nx0,ny0,u0,v0},
+            {nx1,ny1,u1,v1},{nx1,ny0,u1,v0},{nx0,ny0,u0,v0},
+          };
+          [enc setRenderPipelineState:g_blit_pipeline];
+          [enc setVertexBytes:bv length:sizeof(bv) atIndex:0];
+          [enc setFragmentTexture:self.staticTexture atIndex:0];
+          [enc setFragmentSamplerState:g_nearest_sampler atIndex:0];
+          [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+        }
 
       /* 4. Particles (pixiedust / sonicboom / ripple) */
       if (anim.nParticles > 0)

@@ -326,7 +326,7 @@ Returns the new frame with Metal rendering enabled.  */)
 
 DEFUN ("gpu-cursor-mode", Fmtl_cursor_mode, Smtl_cursor_mode, 1, 1, 0,
        doc: /* Set the Metal cursor animation mode.
-MODE is an integer 0-7:
+MODE is an integer 0-8:
   0 = block (static filled rectangle)
   1 = spring (critically-damped spring, default)
   2 = torpedo (trail of past positions)
@@ -334,12 +334,13 @@ MODE is an integer 0-7:
   4 = ripple (3 concentric expanding rings)
   5 = pixiedust (radial particle burst)
   6 = hollow (outline box)
-  7 = beam (thin vertical bar)  */)
+  7 = beam (thin vertical bar)
+  8 = smear (stretches from the old cell to the new one)  */)
   (Lisp_Object mode)
 {
   CHECK_FIXNAT (mode);
   NSUInteger m = (NSUInteger)XFIXNAT (mode);
-  if (m > 7) error ("mtl-cursor-mode: mode must be 0-7");
+  if (m > 8) error ("gpu-cursor-mode: mode must be 0-8");
   g_mtl_cursor_mode = (MtlCursorMode)m;
 
   /* Propagate to live animators: each MtlAnimator caches cursorMode at init,
@@ -400,6 +401,19 @@ DEFUN ("gpu-scroll-duration", Fmtl_scroll_duration, Smtl_scroll_duration,
   double d = XFLOATINT (secs);
   if (d < 0.0 || d > 2.0) error ("mtl-scroll-duration: must be 0.0-2.0");
   g_mtl_scroll_duration = (float)d;
+  return secs;
+}
+
+DEFUN ("gpu-smear-duration", Fmtl_smear_duration, Smtl_smear_duration,
+       1, 1, 0,
+       doc: /* Set the smear cursor's catch-up time in seconds (default 0.12).
+Zero disables the smear.  */)
+  (Lisp_Object secs)
+{
+  CHECK_NUMBER (secs);
+  double d = XFLOATINT (secs);
+  if (d < 0.0 || d > 2.0) error ("gpu-smear-duration: must be 0.0-2.0");
+  g_mtl_smear_duration = (float) d;
   return secs;
 }
 
@@ -714,8 +728,8 @@ buffer-switch cross-fade and the inline video all advance together in
 one deterministic tick (the animator presents are already coalesced by
 the layer).  FRAME defaults to the selected frame.  Returns a mask of
 the subsystems that still need pumping (1 = cursor animations enabled,
-2 = cross-fade running, 4 = video open); 0 lets the timer cancel
-itself.  */)
+2 = cross-fade running, 4 = video open, 8 = cursor smear in flight); 0
+lets the timer cancel itself.  */)
   (Lisp_Object frame)
 {
   if (NILP (frame)) frame = Fselected_frame ();
@@ -726,7 +740,8 @@ itself.  */)
 
   int mask = (g_mtl_animations_enabled ? 1 : 0)
     | (fd.transitionTexture ? 2 : 0)
-    | (fd.videoPlayer ? 4 : 0);
+    | (fd.videoPlayer ? 4 : 0)
+    | (fd.animator.smearActive ? 8 : 0);
   if (mask == 0) return make_fixnum (0);
 
   /* Real elapsed step: the pump re-paces between 30 and 60 Hz, so a
@@ -813,6 +828,7 @@ syms_of_mtlfns (void)
   defsubr (&Smtl_scroll_effect);
   defsubr (&Smtl_scroll_duration);
   defsubr (&Smtl_trail_length);
+  defsubr (&Smtl_smear_duration);
   defsubr (&Smtl_cursor_suppress_effects);
   defsubr (&Smtl_animation_status);
   defsubr (&Smtl_animations);
