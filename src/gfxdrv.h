@@ -89,6 +89,21 @@ struct gfx_glyph
   bool valid;
 };
 
+/* Background fills subject to the frame's `alpha-background'.  */
+enum gfx_bg_kind
+{
+  GFX_BG_DEFAULT,               /* frame background, default-face text */
+  GFX_BG_GLYPHS,                /* backgrounds of other faces */
+  GFX_BG_FRINGE,                /* fringes and internal borders */
+};
+
+/* A fill color may carry an opacity in its top byte: 0 or 0xFF is
+   opaque (plain 0xRRGGBB pixels and NS 0xFFRRGGBB pixels), anything
+   in between is that many 255ths.  */
+#define GFX_COLOR_OPACITY(c)                                    \
+  ((((c) >> 24) & 0xFF) == 0 || (((c) >> 24) & 0xFF) == 0xFF     \
+   ? 1.0f : (((c) >> 24) & 0xFF) / 255.0f)
+
 struct gfx_driver
 {
   const char *name;
@@ -171,6 +186,10 @@ struct gfx_driver
      static cursor to avoid doubling); false for plain static drawing.  */
   bool (*note_cursor) (struct frame *f, int x, int y, int w, int h,
                        unsigned long color);
+
+  /* --- Translucency (optional) --- */
+  /* Opacity in [0, 1] for background fills of KIND on F.  */
+  float (*background_alpha) (struct frame *f, enum gfx_bg_kind kind);
 };
 
 /* The active driver (set by the platform backend before any policy call;

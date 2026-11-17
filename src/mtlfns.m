@@ -847,6 +847,13 @@ syms_of_mtlfns (void)
   defsubr (&Smtl_vsync);
   defsubr (&Smtl_transition_start);
   defsubr (&Smtl_transition_active_p);
+
+  DEFSYM (Qns_alpha_elements, "ns-alpha-elements");
+  DEFSYM (Qns_alpha_all, "ns-alpha-all");
+  DEFSYM (Qns_alpha_default, "ns-alpha-default");
+  DEFSYM (Qns_alpha_glyphs, "ns-alpha-glyphs");
+  DEFSYM (Qns_alpha_fringe, "ns-alpha-fringe");
+  DEFSYM (Qns_background_blur, "ns-background-blur");
 }
 
 #endif /* HAVE_MTL */

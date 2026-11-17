@@ -248,6 +248,13 @@ typedef struct mtl_spring {
 @property (nonatomic, assign) CFTimeInterval              transitionStart;
 @property (nonatomic, assign) float                       transitionDuration;
 
+/* Translucency (alpha-background), refreshed at the start of each
+   render cycle: the opacity, the GFX_BG_* kinds it applies to (bit
+   mask) and the blur radius last applied to the window.  */
+@property (nonatomic, assign) float                       bgAlpha;
+@property (nonatomic, assign) unsigned int                bgKinds;
+@property (nonatomic, assign) int                         appliedBlur;
+
 /* Coalesced present: present now, unless one landed very recently (then
    schedule a deferred one).  Use for "make the frame visible" paths.  */
 - (void)presentCoalesced;
