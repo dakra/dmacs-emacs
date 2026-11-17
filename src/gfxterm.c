@@ -183,13 +183,16 @@ gfx_bg (struct frame *f, unsigned long color, enum gfx_bg_kind kind)
   return (color & 0xFFFFFF) | (byte << 24);
 }
 
-/* Like gfx_bg, for a glyph string's face background BG: the frame's
-   own background counts as GFX_BG_DEFAULT, anything else as
+/* Like gfx_bg, for a glyph string's face background BG: the default
+   face's background counts as GFX_BG_DEFAULT, anything else as
    GFX_BG_GLYPHS.  */
 static unsigned long
 gfx_face_bg (struct frame *f, unsigned long bg)
 {
-  bool def = (bg & 0xFFFFFF) == (gfx_drv->frame_background (f) & 0xFFFFFF);
+  struct face *def_face = FACE_FROM_ID_OR_NULL (f, DEFAULT_FACE_ID);
+  unsigned long def_bg = (def_face ? def_face->background
+                          : gfx_drv->frame_background (f));
+  bool def = (bg & 0xFFFFFF) == (def_bg & 0xFFFFFF);
   return gfx_bg (f, bg, def ? GFX_BG_DEFAULT : GFX_BG_GLYPHS);
 }
 
@@ -1125,6 +1128,10 @@ gfx_scroll_run (struct window *w, struct run *run)
 
   if (height <= 0) return;
 
+  /* The cursor is part of the rendered pixels; erase it so the copy does
+     not carry it along.  It is drawn again when the window update ends.  */
+  gui_clear_cursor (w);
+
   gfx_drv->copy_region (f, x, from_y, width, height, x, to_y);
 }
 
@@ -1271,9 +1278,12 @@ gfx_draw_window_cursor (struct window *w,
   int cwidth = w->phys_cursor_width;
 
   /* Let the driver know where the cursor landed (cursor animations).
-     When it reports that an animated overlay will draw the cursor, skip
-     the static one here to avoid a double cursor.  */
-  bool animated = gfx_drv->note_cursor
+     The animator tracks one cursor per frame, so only the selected
+     window's cursor feeds it.  When it reports that an animated overlay
+     will draw the cursor, skip the static one here to avoid a double
+     cursor.  */
+  bool animated = w == XWINDOW (f->selected_window)
+                  && gfx_drv->note_cursor
                   && gfx_drv->note_cursor (f, fx, fy, cwidth, h, cc);
 
   if (!animated)

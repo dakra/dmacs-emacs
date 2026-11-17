@@ -513,15 +513,7 @@ mtl_global_setup (void)
       return NO;
     }
 
-  /* Glyph atlas — 2048×2048 R8Unorm (grayscale coverage) */
-  MTLTextureDescriptor *td =
-    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
-                                                       width:MTL_ATLAS_WIDTH
-                                                      height:MTL_ATLAS_HEIGHT
-                                                   mipmapped:NO];
-  td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-  g_atlas = [g_device newTextureWithDescriptor:td];
-  mtl_atlas_reset ();           /* reserve the white block for rect quads */
+  mtl_atlas_reset ();           /* create the glyph atlas */
 
   /* Linear sampler: for glyph atlas (sub-pixel accuracy) */
   MTLSamplerDescriptor *sd = [[MTLSamplerDescriptor alloc] init];
@@ -702,16 +694,52 @@ glyph_cache_init (void)
   g_atlas_row_h   = 0;
 }
 
-/* Reset the atlas packing and the glyph table, then re-reserve the 4x4
-   white block at (0,0) that batched solid rects sample (see g_batch).
-   Queued quads still reference the old layout, so they are flushed
-   first.  Used at atlas creation, on overflow repack, and on a backing
-   scale change.  */
+/* Fonts with entries in the glyph caches.  The caches key on the CTFont
+   address, so each font stays retained while its entries exist; a freed
+   font's address could otherwise be reused by a different font, which
+   would then hit the old font's glyphs.  Members are compared by
+   address: two CTFonts opened with the same name and size are distinct
+   objects that are CFEqual.  */
+static CFMutableSetRef g_glyph_fonts;
+
+static void
+mtl_glyph_font_retain (CTFontRef font)
+{
+  if (!g_glyph_fonts)
+    {
+      CFSetCallBacks callbacks = kCFTypeSetCallBacks;
+      callbacks.equal = NULL;
+      callbacks.hash = NULL;
+      g_glyph_fonts = CFSetCreateMutable (kCFAllocatorDefault, 0, &callbacks);
+    }
+  CFSetAddValue (g_glyph_fonts, font);
+}
+
+/* Start a fresh glyph atlas (2048x2048 R8Unorm, grayscale coverage) and
+   empty the glyph caches, then reserve the 4x4 white block at (0,0) that
+   batched solid rects sample (see g_batch).  Queued quads still reference
+   the old layout, so they are flushed first.  The atlas is a new texture
+   rather than the old one overwritten: draws already encoded but not yet
+   executed keep the old texture alive and must still sample its
+   contents.  Used at startup, on overflow, and on a backing scale
+   change.  */
 static void
 mtl_atlas_reset (void)
 {
   mtl_flush_batch ();
   glyph_cache_init ();
+  mtl_color_glyph_cache_clear ();
+  if (g_glyph_fonts)
+    CFSetRemoveAllValues (g_glyph_fonts);
+
+  MTLTextureDescriptor *td =
+    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+                                                       width:MTL_ATLAS_WIDTH
+                                                      height:MTL_ATLAS_HEIGHT
+                                                   mipmapped:NO];
+  td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+  [g_atlas release];
+  g_atlas = [g_device newTextureWithDescriptor:td];
   if (g_atlas)
     {
       static const uint8_t white[16] = {
@@ -830,10 +858,8 @@ mtl_rasterize_glyph_id (CTFontRef font, CGGlyph cgGlyph, uint64_t key)
     }
   if (g_atlas_next_y + bh > MTL_ATLAS_HEIGHT)
     {
-      /* Atlas full: repack from the top (mtl_atlas_reset flushes the
-         queued quads that still reference the old layout).  */
+      /* Atlas full: start a fresh one.  */
       mtl_atlas_reset ();
-      entry = glyph_cache_insert (key);
     }
 
   /* Rasterize glyph to grayscale CGContext */
@@ -910,7 +936,10 @@ mtl_cache_glyph_id (CTFontRef font, CGGlyph glyphId)
   if (e) return e;
   if (!g_atlas) return NULL;
 
-  return mtl_rasterize_glyph_id (font, glyphId, key);
+  e = mtl_rasterize_glyph_id (font, glyphId, key);
+  if (e)
+    mtl_glyph_font_retain (font);
+  return e;
 }
 
 /* mtl_cache_glyph — SECONDARY path for off-screen test renders.
@@ -948,6 +977,7 @@ static const char mtl_frame_key;
 MtlFrameData *
 mtl_get_frame_data (struct frame *f)
 {
+  if (!FRAME_NS_P (f)) return NULL;
   NSView *view = FRAME_NS_VIEW (f);
   if (!view) return NULL;
   return (__bridge MtlFrameData *)objc_getAssociatedObject (
@@ -1243,6 +1273,7 @@ mtl_log_seq_p (void)
    never animate.  Same medicine as video playback (mtl-video-tick). */
 - (void)tickWithDt:(float)dt
 {
+  if (!self.emacsFrame) return;   /* frame deleted */
   MtlFrameData *fd = mtl_get_frame_data (self.emacsFrame);
   if (!fd || !fd.metalLayer) return;
 
@@ -1722,7 +1753,6 @@ mtl_log_seq_p (void)
     {
       g_atlas_scale  = scale;
       mtl_atlas_reset ();
-      mtl_color_glyph_cache_clear ();   /* color glyphs are scale-baked too */
     }
 
   /* Ensure staticTexture exists and matches drawable size.
@@ -2684,6 +2714,14 @@ mtl_warm_glyph_cache (struct frame *f)
    Phase 5: inline image support — NSImage (EmacsImage) → MTLTexture
    ----------------------------------------------------------------------- */
 
+/* Cache validity stamp for IMG: its hash, plus the refresh counter of
+   canvas images, whose pixels change in place on `canvas-refresh'.  */
+static EMACS_UINT
+mtl_image_stamp (struct image *img)
+{
+  return img->hash ^ ((EMACS_UINT) img->refresh * 0x9E3779B97F4A7C15u);
+}
+
 static id<MTLTexture>
 mtl_texture_for_image (struct image *img)
 {
@@ -2709,7 +2747,8 @@ mtl_texture_for_image (struct image *img)
     CFDictionaryGetValue (g_image_texture_cache, (const void *)img);
   EMACS_UINT cached_hash = (EMACS_UINT) (uintptr_t)
     CFDictionaryGetValue (g_image_hash_cache, (const void *)img);
-  if (tex && cached_hash == img->hash
+  EMACS_UINT stamp = mtl_image_stamp (img);
+  if (tex && cached_hash == stamp
       && tex.width == w && tex.height == h)
     return tex;
 
@@ -2773,7 +2812,7 @@ mtl_texture_for_image (struct image *img)
   CFDictionarySetValue (g_image_texture_cache, (const void *)img,
                         (__bridge CFTypeRef)tex);
   CFDictionarySetValue (g_image_hash_cache, (const void *)img,
-                        (const void *) (uintptr_t) img->hash);
+                        (const void *) (uintptr_t) stamp);
   return tex;
 }
 
@@ -2836,8 +2875,8 @@ mtl_draw_image_texture (MtlFrameData *fd, id<MTLTexture> tex,
 
 static NSMutableDictionary<NSNumber *, MtlColorGlyph *> *g_color_glyph_cache;
 
-/* Called when g_atlas_scale changes: color glyphs are baked at physical
-   resolution too, so they must re-rasterize at the new scale. */
+/* Called from mtl_atlas_reset: color glyphs are baked at physical
+   resolution and keyed on the font address like the atlas entries.  */
 static void
 mtl_color_glyph_cache_clear (void)
 {
@@ -2906,6 +2945,7 @@ mtl_color_glyph (CTFontRef font, CGGlyph g)
   cg.bearing_y = bh - raster_oy;
   cg.advance_x = (float)(adv.width / s);
   g_color_glyph_cache[k] = cg;
+  mtl_glyph_font_retain (font);
   return cg;
 }
 
@@ -3156,7 +3196,9 @@ mtl_drv_note_cursor (struct frame *f, int x, int y, int w, int h,
       return true;
     }
   fd.animator.cursorHidden = NO;
-  fd.animator.cursorColor = color;
+  /* The top byte marks the color as set, so black (0) is not taken for
+     "no color yet" by the compositor.  */
+  fd.animator.cursorColor = color | 0xFF000000;
   [fd.animator setCursorX:x y:y width:w height:h];
   /* Cursor-only motion takes redisplay's fast path: no render cycle gets
      opened, so nothing would present the moved overlay (the display link
@@ -3217,6 +3259,35 @@ static struct gfx_driver mtl_gfx_driver =
    update_begin, so there is no active render encoder yet: we record the rect and
    flush it to background at the start of the next frame (see beginFrame).  Then
    delegate to NS to position the scroller.  Mirrors ns_set_*_scroll_bar. */
+static void (*mtl_orig_delete_frame_hook) (struct frame *) = NULL;
+static void mtl_detach_resize_observer (NSView *view);
+
+/* Tear down F's Metal state before the platform destroys the frame: the
+   animator's display link and any scheduled present outlive the frame
+   otherwise and would touch it after it is freed.  */
+static void
+mtl_delete_frame (struct frame *f)
+{
+  MtlFrameData *fd = mtl_get_frame_data (f);
+  if (fd)
+    {
+      [fd.animator stopAnimating];
+      fd.animator.emacsFrame = NULL;
+      if (fd.videoPlayer)
+        {
+          [fd.videoPlayer shutdown];
+          fd.videoPlayer = nil;
+        }
+      fd.emacsFrame = NULL;
+      mtl_detach_resize_observer (FRAME_NS_VIEW (f));
+      gfx_free_frame_state (f);
+      objc_setAssociatedObject (FRAME_NS_VIEW (f), &mtl_frame_key, nil,
+                                OBJC_ASSOCIATION_RETAIN);
+    }
+  if (mtl_orig_delete_frame_hook)
+    mtl_orig_delete_frame_hook (f);
+}
+
 static void (*mtl_orig_set_vsb_hook) (struct window *, int, int, int) = NULL;
 static void (*mtl_orig_set_hsb_hook) (struct window *, int, int, int) = NULL;
 
@@ -3648,6 +3719,12 @@ mtl_patch_terminal_rif (struct frame *f)
   term->clear_frame_hook      = gfx_clear_frame;
   term->frame_up_to_date_hook = gfx_frame_up_to_date;
 
+  if (term->delete_frame_hook != mtl_delete_frame)
+    {
+      mtl_orig_delete_frame_hook = term->delete_frame_hook;
+      term->delete_frame_hook = mtl_delete_frame;
+    }
+
   /* D1: wrap the scroll bar hooks so the gutter is cleared in the Metal static
      texture (not just CoreGraphics) when windows are split or re-laid out. */
   if (term->set_vertical_scroll_bar_hook != mtl_set_vertical_scroll_bar)
@@ -3693,6 +3770,20 @@ mtl_patch_terminal_rif (struct frame *f)
       [view addObserver:obs forKeyPath:@"window"
                  options:NSKeyValueObservingOptionNew context:NULL];
     }
+}
+
+static void
+mtl_detach_resize_observer (NSView *view)
+{
+  MtlResizeObserver *obs = objc_getAssociatedObject (view, &mtl_resize_obs_key);
+  if (!obs)
+    return;
+  [view removeObserver:obs forKeyPath:@"frame"];
+  [view removeObserver:obs forKeyPath:@"window"];
+  obs.layer = nil;
+  obs.emacsFrame = NULL;
+  objc_setAssociatedObject (view, &mtl_resize_obs_key, nil,
+                            OBJC_ASSOCIATION_RETAIN);
 }
 
 /* -----------------------------------------------------------------------
