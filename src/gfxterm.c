@@ -168,6 +168,31 @@ gfx_frame_gpu_p (struct frame *f)
   return gfx_ready (f);
 }
 
+/* COLOR with F's background opacity for KIND folded into its top byte
+   (see GFX_COLOR_OPACITY).  */
+static unsigned long
+gfx_bg (struct frame *f, unsigned long color, enum gfx_bg_kind kind)
+{
+  if (!gfx_drv->background_alpha)
+    return color;
+  float a = gfx_drv->background_alpha (f, kind);
+  if (a >= 1.0f)
+    return color;
+  unsigned long byte = lroundf (a * 255.0f);
+  byte = byte < 1 ? 1 : byte > 254 ? 254 : byte;
+  return (color & 0xFFFFFF) | (byte << 24);
+}
+
+/* Like gfx_bg, for a glyph string's face background BG: the frame's
+   own background counts as GFX_BG_DEFAULT, anything else as
+   GFX_BG_GLYPHS.  */
+static unsigned long
+gfx_face_bg (struct frame *f, unsigned long bg)
+{
+  bool def = (bg & 0xFFFFFF) == (gfx_drv->frame_background (f) & 0xFFFFFF);
+  return gfx_bg (f, bg, def ? GFX_BG_DEFAULT : GFX_BG_GLYPHS);
+}
+
 /* Open a render cycle and flush any queued scroll-bar gutter clears (they
    were queued during layout, when no cycle was open).  Every place the
    policy opens a cycle goes through here.  */
@@ -178,7 +203,8 @@ gfx_begin_frame (struct frame *f)
   gfx_drv->begin_frame (f);
   if (st->n_pending_clears > 0)
     {
-      unsigned long bg = gfx_drv->frame_background (f);
+      unsigned long bg = gfx_bg (f, gfx_drv->frame_background (f),
+                                 GFX_BG_DEFAULT);
       for (int i = 0; i < st->n_pending_clears; i++)
         gfx_drv->fill_rect (f, st->pending_clears[i].x,
                             st->pending_clears[i].y,
@@ -619,7 +645,8 @@ gfx_draw_glyph_string_impl (struct glyph_string *s)
                            && s->first_glyph->type == IMAGE_GLYPH))
                 ? max (face->box_horizontal_line_width, 0) : 0;
       gfx_drv->fill_rect (f, s->x, s->y + blw,
-                          s->background_width, s->height - 2 * blw, bg);
+                          s->background_width, s->height - 2 * blw,
+                          s->hl == DRAW_CURSOR ? bg : gfx_face_bg (f, bg));
       s->background_filled_p = true;
     }
 
@@ -893,7 +920,8 @@ gfx_clear_frame (struct frame *f)
   if (immediate) gfx_begin_frame (f);
 
   gfx_drv->fill_rect (f, 0, 0, FRAME_PIXEL_WIDTH (f), FRAME_PIXEL_HEIGHT (f),
-                      gfx_drv->frame_background (f));
+                      gfx_bg (f, gfx_drv->frame_background (f),
+                              GFX_BG_DEFAULT));
 
   if (immediate)
     gfx_drv->end_frame (f, false);
@@ -909,7 +937,8 @@ gfx_clear_frame_area (struct frame *f, int x, int y, int width, int height)
       return;
     }
   gfx_drv->fill_rect (f, x, y, width, height,
-                      gfx_drv->frame_background (f));
+                      gfx_bg (f, gfx_drv->frame_background (f),
+                              GFX_BG_DEFAULT));
 }
 
 void
@@ -946,6 +975,7 @@ gfx_clear_under_internal_border (struct frame *f)
     face = FACE_FROM_ID_OR_NULL (f, DEFAULT_FACE_ID);
   unsigned long bg = face ? face->background
                           : gfx_drv->frame_background (f);
+  bg = gfx_bg (f, bg, GFX_BG_FRINGE);
 
   gfx_drv->fill_rect (f, 0, margin, width, border, bg);
   gfx_drv->fill_rect (f, 0, 0, border, height, bg);
@@ -1019,7 +1049,8 @@ gfx_update_begin (struct frame *f)
           if (y0 < 0) y0 = 0;
           gfx_drv->fill_rect (f, 0, y0, FRAME_PIXEL_WIDTH (f),
                               FRAME_PIXEL_HEIGHT (f) - y0,
-                              gfx_drv->frame_background (f));
+                              gfx_bg (f, gfx_drv->frame_background (f),
+                                      GFX_BG_DEFAULT));
         }
       st->last_mini_height = mh;
     }
@@ -1151,6 +1182,7 @@ gfx_after_update_window_line (struct window *w, struct glyph_row *desired_row)
       struct face *face = FACE_FROM_ID_OR_NULL (f, face_id);
       unsigned long bg = face ? face->background
                               : gfx_drv->frame_background (f);
+      bg = gfx_bg (f, bg, GFX_BG_FRINGE);
       gfx_drv->fill_rect (f, 0, y, width, height, bg);
       gfx_drv->fill_rect (f, FRAME_PIXEL_WIDTH (f) - width, y,
                           width, height, bg);
@@ -1381,6 +1413,7 @@ gfx_draw_fringe_bitmap (struct window *w, struct glyph_row *row,
      an overlay bitmap.  Mirrors ns_draw_fringe_bitmap.  */
   if (!p->overlay_p)
     {
+      bg = gfx_bg (f, bg, GFX_BG_FRINGE);
       if (p->bx >= 0)
         gfx_drv->fill_rect (f, p->bx, p->by, p->nx, p->ny, bg);
       int fy0 = max (p->y, cy0), fy1 = min (p->y + p->h, cy1);

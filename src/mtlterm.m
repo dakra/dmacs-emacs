@@ -114,7 +114,16 @@ vertex GlyphOut glyph_vertex(GlyphVertex in [[stage_in]],
   return out;
 }
 
-fragment float4 glyph_fragment(GlyphOut in [[stage_in]],
+// Premultiplied output plus a second blend source holding the coverage:
+// the pipeline computes dst = color + dst * (1 - factor.a), so a solid
+// quad (coverage 1) replaces the destination -- translucent backgrounds
+// included -- while glyphs composite over what is below.
+struct GlyphFragOut {
+  float4 color  [[color(0), index(0)]];
+  float4 factor [[color(0), index(1)]];
+};
+
+fragment GlyphFragOut glyph_fragment(GlyphOut in [[stage_in]],
                                 texture2d<float> atlas [[texture(0)]],
                                 sampler smp           [[sampler(0)]]) {
   float coverage = atlas.sample(smp, in.texCoord).r;
@@ -123,7 +132,11 @@ fragment float4 glyph_fragment(GlyphOut in [[stage_in]],
   // Plain linear coverage leaves Metal text a touch lighter than NS. Apply a
   // mild gamma (<1) to lift coverage uniformly and match NS's weight.
   coverage = pow(coverage, 0.82);
-  return float4(in.color.rgb, in.color.a * coverage);
+  float a = in.color.a * coverage;
+  GlyphFragOut out;
+  out.color  = float4(in.color.rgb * a, a);
+  out.factor = float4(coverage);
+  return out;
 }
 
 vertex RectOut rect_vertex(RectVertex in [[stage_in]],
@@ -201,9 +214,8 @@ vertex ImageOut image_vertex(ImageVertex in [[stage_in]],
 fragment float4 image_fragment(ImageOut in [[stage_in]],
                                 texture2d<float> img [[texture(0)]],
                                 sampler smp          [[sampler(0)]]) {
-  float4 color = img.sample(smp, in.texCoord);
-  color.a *= in.alpha;
-  return color;
+  // Textures hold premultiplied alpha.
+  return img.sample(smp, in.texCoord) * in.alpha;
 }
 )MSL";
 
@@ -345,6 +357,115 @@ ns_color_to_pixel (NSColor *c)
 }
 
 /* -----------------------------------------------------------------------
+   Translucent frames (alpha-background)
+
+   The `ns-alpha-elements' frame parameter picks which backgrounds the
+   opacity applies to: `ns-alpha-default' (the frame background and
+   default-face text), `ns-alpha-glyphs' (other faces' backgrounds),
+   `ns-alpha-fringe' (fringes, internal borders), a list of these, or
+   t / `ns-alpha-all' / nil for all of them.  `ns-background-blur' is the
+   radius of the blur applied to whatever shows through.
+   ----------------------------------------------------------------------- */
+
+extern int CGSSetWindowBackgroundBlurRadius (int connection, int window,
+                                             int radius);
+extern int CGSDefaultConnectionForThread (void);
+
+#define MTL_BG_ALL ((1u << GFX_BG_DEFAULT) | (1u << GFX_BG_GLYPHS) \
+                    | (1u << GFX_BG_FRINGE))
+
+static unsigned int
+mtl_alpha_element_bit (Lisp_Object sym)
+{
+  if (EQ (sym, Qt) || EQ (sym, Qns_alpha_all))
+    return MTL_BG_ALL;
+  if (EQ (sym, Qns_alpha_default))
+    return 1u << GFX_BG_DEFAULT;
+  if (EQ (sym, Qns_alpha_glyphs))
+    return 1u << GFX_BG_GLYPHS;
+  if (EQ (sym, Qns_alpha_fringe))
+    return 1u << GFX_BG_FRINGE;
+  return 0;
+}
+
+static unsigned int
+mtl_alpha_kinds (struct frame *f)
+{
+  Lisp_Object el = get_frame_param (f, Qns_alpha_elements);
+  if (NILP (el))
+    return MTL_BG_ALL;
+  if (!CONSP (el))
+    return mtl_alpha_element_bit (el);
+  unsigned int kinds = 0;
+  for (; CONSP (el); el = XCDR (el))
+    kinds |= mtl_alpha_element_bit (XCAR (el));
+  return kinds;
+}
+
+static float
+mtl_background_alpha (struct frame *f, enum gfx_bg_kind kind)
+{
+  MtlFrameData *fd = mtl_get_frame_data (f);
+  if (!fd || !(fd.bgKinds & (1u << kind)))
+    return 1.0f;
+  return fd.bgAlpha;
+}
+
+/* Bring FD's window, layers and blur in line with the frame's
+   alpha-background.  Runs at the start of every render cycle, which also
+   undoes the NS backend resetting the window to opaque (e.g. when the
+   background color changes).  */
+static void
+mtl_sync_translucency (MtlFrameData *fd)
+{
+  struct frame *f = fd.emacsFrame;
+  if (!f)
+    return;
+
+  double alpha = f->alpha_background;
+  fd.bgAlpha = alpha < 0 ? 0.0f : alpha < 1 ? (float) alpha : 1.0f;
+  fd.bgKinds = fd.bgAlpha < 1.0f ? mtl_alpha_kinds (f) : 0;
+  BOOL clear = fd.bgKinds != 0;
+
+  if (fd.metalLayer.opaque == clear)
+    fd.metalLayer.opaque = !clear;
+
+  NSView *view = FRAME_NS_VIEW (f);
+  NSWindow *win = [view window];
+  if (!win)
+    return;
+  if ([win isOpaque] == clear)
+    [win setOpaque:!clear];
+  if (clear)
+    {
+      if ([[win backgroundColor] alphaComponent] > 0)
+        [win setBackgroundColor:[NSColor clearColor]];
+      /* The NS backend's own layer sits under ours; its last CPU-drawn
+         frame would show through.  */
+      if (view.layer.contents)
+        view.layer.contents = nil;
+    }
+  else if ([[win backgroundColor] alphaComponent] == 0)
+    [win setBackgroundColor:FRAME_BACKGROUND_COLOR (f)];
+
+  int radius = 0;
+  if (clear)
+    {
+      Lisp_Object blur = get_frame_param (f, Qns_background_blur);
+      if (FIXNATP (blur))
+        radius = XFIXNAT (blur) > 1000 ? 1000 : (int) XFIXNAT (blur);
+      else if (FLOATP (blur) && XFLOAT_DATA (blur) > 0)
+        radius = XFLOAT_DATA (blur) > 1000 ? 1000 : (int) XFLOAT_DATA (blur);
+    }
+  if (radius != fd.appliedBlur && [win windowNumber] > 0)
+    {
+      CGSSetWindowBackgroundBlurRadius (CGSDefaultConnectionForThread (),
+                                        (int) [win windowNumber], radius);
+      fd.appliedBlur = radius;
+    }
+}
+
+/* -----------------------------------------------------------------------
    Global Metal setup (called once)
    ----------------------------------------------------------------------- */
 
@@ -406,10 +527,10 @@ mtl_global_setup (void)
     pd.fragmentFunction = [g_library newFunctionWithName:@"glyph_fragment"];
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     pd.colorAttachments[0].blendingEnabled = YES;
-    pd.colorAttachments[0].sourceRGBBlendFactor      = MTLBlendFactorSourceAlpha;
-    pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    pd.colorAttachments[0].sourceAlphaBlendFactor    = MTLBlendFactorSourceAlpha;
-    pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    pd.colorAttachments[0].sourceRGBBlendFactor      = MTLBlendFactorOne;
+    pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSource1Alpha;
+    pd.colorAttachments[0].sourceAlphaBlendFactor    = MTLBlendFactorOne;
+    pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSource1Alpha;
 
     MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
     vd.attributes[0].format = MTLVertexFormatFloat2;
@@ -439,7 +560,7 @@ mtl_global_setup (void)
     pd.colorAttachments[0].blendingEnabled = YES;
     pd.colorAttachments[0].sourceRGBBlendFactor      = MTLBlendFactorSourceAlpha;
     pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    pd.colorAttachments[0].sourceAlphaBlendFactor    = MTLBlendFactorSourceAlpha;
+    pd.colorAttachments[0].sourceAlphaBlendFactor    = MTLBlendFactorOne;
     pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
 
     MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
@@ -489,7 +610,7 @@ mtl_global_setup (void)
     pd.colorAttachments[0].blendingEnabled = YES;
     pd.colorAttachments[0].sourceRGBBlendFactor      = MTLBlendFactorSourceAlpha;
     pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    pd.colorAttachments[0].sourceAlphaBlendFactor    = MTLBlendFactorSourceAlpha;
+    pd.colorAttachments[0].sourceAlphaBlendFactor    = MTLBlendFactorOne;
     pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
 
     MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
@@ -513,9 +634,9 @@ mtl_global_setup (void)
     pd.fragmentFunction = [g_library newFunctionWithName:@"image_fragment"];
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     pd.colorAttachments[0].blendingEnabled = YES;
-    pd.colorAttachments[0].sourceRGBBlendFactor      = MTLBlendFactorSourceAlpha;
+    pd.colorAttachments[0].sourceRGBBlendFactor      = MTLBlendFactorOne;
     pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    pd.colorAttachments[0].sourceAlphaBlendFactor    = MTLBlendFactorSourceAlpha;
+    pd.colorAttachments[0].sourceAlphaBlendFactor    = MTLBlendFactorOne;
     pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
 
     MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
@@ -1465,7 +1586,8 @@ mtl_video_present_due (MtlFrameData *fd)
   MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
   rpd.colorAttachments[0].texture     = self.staticTexture;
   rpd.colorAttachments[0].loadAction  = clear ? MTLLoadActionClear : MTLLoadActionLoad;
-  rpd.colorAttachments[0].clearColor  = MTLClearColorMake (r, g, b, 1.0);
+  double a = f ? mtl_background_alpha (f, GFX_BG_DEFAULT) : 1.0;
+  rpd.colorAttachments[0].clearColor  = MTLClearColorMake (r * a, g * a, b * a, a);
   rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
 
   self.encoder = [self.cmdBuf renderCommandEncoderWithDescriptor:rpd];
@@ -1646,6 +1768,8 @@ mtl_video_present_due (MtlFrameData *fd)
   u->screen_width  = (float)sz.width;
   u->screen_height = (float)sz.height;
 
+  mtl_sync_translucency (self);
+
   self.cmdBuf = [g_queue commandBuffer];
   [self openRenderEncoderClear:needsClear];
 }
@@ -1693,7 +1817,7 @@ mtl_flush_batch (void)
 static void
 mtl_batch_append (MtlFrameData *fd, float x0, float y0, float x1, float y1,
                   float u0, float v0, float u1, float v1,
-                  float r, float g, float b)
+                  float r, float g, float b, float a)
 {
   if (x0 >= x1 || y0 >= y1)
     return;                     /* degenerate quad: nothing to draw */
@@ -1729,9 +1853,9 @@ mtl_batch_append (MtlFrameData *fd, float x0, float y0, float x1, float y1,
     }
 
   MtlGlyphVertex quad[6] = {
-    {x0,y0, u0,v0, r,g,b,1}, {x1,y0, u1,v0, r,g,b,1},
-    {x0,y1, u0,v1, r,g,b,1}, {x1,y0, u1,v0, r,g,b,1},
-    {x1,y1, u1,v1, r,g,b,1}, {x0,y1, u0,v1, r,g,b,1},
+    {x0,y0, u0,v0, r,g,b,a}, {x1,y0, u1,v0, r,g,b,a},
+    {x0,y1, u0,v1, r,g,b,a}, {x1,y0, u1,v0, r,g,b,a},
+    {x1,y1, u1,v1, r,g,b,a}, {x0,y1, u0,v1, r,g,b,a},
   };
   memcpy (g_batch + g_batch_verts, quad, sizeof quad);
   g_batch_verts += 6;
@@ -1749,7 +1873,7 @@ mtl_batch_append (MtlFrameData *fd, float x0, float y0, float x1, float y1,
                     (float) NSMinX (rect), (float) NSMinY (rect),
                     (float) NSMaxX (rect), (float) NSMaxY (rect),
                     MTL_WHITE_U, MTL_WHITE_V, MTL_WHITE_U, MTL_WHITE_V,
-                    r, g, b);
+                    r, g, b, GFX_COLOR_OPACITY (color));
 }
 
 - (void)drawGlyph:(MtlGlyphCacheEntry *)ge
@@ -1776,7 +1900,7 @@ mtl_batch_append (MtlFrameData *fd, float x0, float y0, float x1, float y1,
                     (float) ge->atlas_y / MTL_ATLAS_HEIGHT,
                     (float) (ge->atlas_x + ge->width) / MTL_ATLAS_WIDTH,
                     (float) (ge->atlas_y + ge->height) / MTL_ATLAS_HEIGHT,
-                    fr, fg, fb);
+                    fr, fg, fb, 1);
 }
 
 /* Rasterize a fringe bitmap (rows of bits, MSB-first like the X backend's
@@ -3087,6 +3211,7 @@ static struct gfx_driver mtl_gfx_driver =
   .frame_background     = mtl_drv_frame_background,
   .cursor_color         = mtl_drv_cursor_color,
   .note_cursor          = mtl_drv_note_cursor,
+  .background_alpha     = mtl_background_alpha,
 };
 
 /* -----------------------------------------------------------------------
