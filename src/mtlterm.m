@@ -1528,6 +1528,9 @@ mtl_video_present_due (MtlFrameData *fd)
 - (void)applyScissorNow;
 @end
 
+static void mtl_fill_rect_enc (id<MTLRenderCommandEncoder>, float, float,
+                               float, float, unsigned long, float, float);
+
 @implementation MtlFrameData
 
 - (void)dealloc
@@ -2245,6 +2248,21 @@ mtl_batch_append (MtlFrameData *fd, float x0, float y0, float x1, float y1,
           [enc drawPrimitives:MTLPrimitiveTypeTriangle
                   vertexStart:0 vertexCount:6];
         }
+    }
+
+  /* Selected-window border.  */
+  if (self.borderWidth > 0 && !NSIsEmptyRect (self.borderRect))
+    {
+      NSRect b = self.borderRect;
+      float x = NSMinX (b), y = NSMinY (b), w = NSWidth (b), h = NSHeight (b);
+      float t = MIN (self.borderWidth, MIN (w, h) / 2);
+      unsigned long c = self.borderColor;
+      float sw = sz.width, sh = sz.height;
+      mtl_fill_rect_enc (enc, x, y, w, t, c, sw, sh);
+      mtl_fill_rect_enc (enc, x, y + h - t, w, t, c, sw, sh);
+      mtl_fill_rect_enc (enc, x, y + t, t, h - 2 * t, c, sw, sh);
+      mtl_fill_rect_enc (enc, x + w - t, y + t, t, h - 2 * t, c, sw, sh);
+      [enc setVertexBuffer:self.uniformBuffer offset:0 atIndex:1];
     }
 
   /* Animation overlay (cursor effects, trail, particles) is opt-in.  When off,
@@ -3654,6 +3672,68 @@ static const char mtl_resize_obs_key;
 
 @end
 
+/* The rect of F's selected-window border in frame pixels, or an empty
+   rect if F should not show one: only the frame with the input focus
+   does (or the root of the focused child frame).  While the minibuffer
+   is selected, the border stays on the window it was entered from.  */
+static NSRect
+mtl_window_border_rect (struct frame *f)
+{
+  struct frame *focus = FRAME_DISPLAY_INFO (f)->ns_focus_frame;
+  if (!focus || root_frame (focus) != f)
+    return NSZeroRect;
+
+  Lisp_Object window = f->selected_window;
+  if (MINI_WINDOW_P (XWINDOW (window)))
+    window = minibuf_selected_window;
+  if (!WINDOW_LIVE_P (window) || WINDOW_XFRAME (XWINDOW (window)) != f)
+    return NSZeroRect;
+
+  struct window *w = XWINDOW (window);
+  int ib = FRAME_INTERNAL_BORDER_WIDTH (f);
+  int x0 = WINDOW_LEFT_EDGE_X (w), y0 = WINDOW_TOP_EDGE_Y (w);
+  int x1 = WINDOW_RIGHT_EDGE_X (w), y1 = WINDOW_BOTTOM_EDGE_Y (w);
+
+  /* Use the frame's internal border where the window touches it, so that
+     less of the window is covered.  */
+  int outset = MIN (ib, mtl_get_frame_data (f).borderWidth);
+  bool right = x1 == FRAME_PIXEL_WIDTH (f) - ib;
+  bool bottom = y1 == FRAME_PIXEL_HEIGHT (f) - ib;
+  x1 += right ? outset : - WINDOW_RIGHT_DIVIDER_WIDTH (w);
+  y1 += bottom ? outset : - WINDOW_BOTTOM_DIVIDER_WIDTH (w);
+  if (x0 == ib) x0 -= outset;
+  if (y0 == ib + FRAME_TOP_MARGIN_HEIGHT (f)) y0 -= outset;
+  return NSMakeRect (x0, y0, x1 - x0, y1 - y0);
+}
+
+void
+mtl_update_window_border (struct frame *f, bool force)
+{
+  MtlFrameData *fd = mtl_get_frame_data (f);
+  if (!fd) return;
+
+  NSRect r = fd.borderWidth > 0 ? mtl_window_border_rect (f) : NSZeroRect;
+  if (NSEqualRects (r, fd.borderRect) && (!force || NSIsEmptyRect (r)))
+    return;
+  fd.borderRect = r;
+  if (FRAME_VISIBLE_P (f) && !fd.encoder)
+    {
+      block_input ();
+      [fd presentCoalesced];
+      unblock_input ();
+    }
+}
+
+/* Echo area updates also run outside of redisplay, where the selected
+   window can be a temporary one.  */
+static void
+mtl_update_end (struct frame *f)
+{
+  if (redisplaying_p)
+    mtl_update_window_border (f, false);
+  gfx_update_end (f);
+}
+
 /* One copy of the NS rif, patched with our Metal drawing functions.
    Allocated once when mtl_patch_terminal_rif is first called.
    CRITICAL: We must NOT replace the entire rif — the NS rif's
@@ -3717,7 +3797,7 @@ mtl_patch_terminal_rif (struct frame *f)
       gfx_fallback.frame_up_to_date = term->frame_up_to_date_hook;
     }
   term->update_begin_hook     = gfx_update_begin;
-  term->update_end_hook       = gfx_update_end;
+  term->update_end_hook       = mtl_update_end;
   term->clear_frame_hook      = gfx_clear_frame;
   term->frame_up_to_date_hook = gfx_frame_up_to_date;
 

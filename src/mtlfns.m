@@ -417,6 +417,36 @@ Zero disables the smear.  */)
   return secs;
 }
 
+DEFUN ("gpu-selected-window-border", Fmtl_selected_window_border,
+       Smtl_selected_window_border, 3, 3, 0,
+       doc: /* Set the border drawn around the selected window of FRAME.
+WIDTH is its width in pixels, or nil for no border.  COLOR is a color
+name.  The border shows only while FRAME has the input focus; call this
+again when the focus changes.  Return nil if FRAME does not use the GPU
+backend, t otherwise.  */)
+  (Lisp_Object frame, Lisp_Object width, Lisp_Object color)
+{
+  CHECK_LIVE_FRAME (frame);
+  struct frame *f = XFRAME (frame);
+  MtlFrameData *fd = mtl_get_frame_data (f);
+  if (!fd) return Qnil;
+
+  int w = NILP (width) ? 0 : check_integer_range (width, 0, INT_MAX);
+  Emacs_Color c = { 0 };
+  if (w > 0)
+    {
+      CHECK_STRING (color);
+      if (!FRAME_TERMINAL (f)->defined_color_hook (f, SSDATA (color), &c,
+                                                   true, false))
+        error ("Undefined color: %s", SDATA (color));
+    }
+  bool changed = w != fd.borderWidth || c.pixel != fd.borderColor;
+  fd.borderWidth = w;
+  fd.borderColor = c.pixel;
+  mtl_update_window_border (f, changed);
+  return Qt;
+}
+
 DEFUN ("gpu-trail-length", Fmtl_trail_length, Smtl_trail_length, 1, 1, 0,
        doc: /* Set torpedo cursor trail length (1-40, default 20).  */)
   (Lisp_Object len)
@@ -829,6 +859,7 @@ syms_of_mtlfns (void)
   defsubr (&Smtl_scroll_duration);
   defsubr (&Smtl_trail_length);
   defsubr (&Smtl_smear_duration);
+  defsubr (&Smtl_selected_window_border);
   defsubr (&Smtl_cursor_suppress_effects);
   defsubr (&Smtl_animation_status);
   defsubr (&Smtl_animations);

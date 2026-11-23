@@ -248,6 +248,13 @@ typedef struct mtl_spring {
 @property (nonatomic, assign) CFTimeInterval              transitionStart;
 @property (nonatomic, assign) float                       transitionDuration;
 
+/* Border around the selected window, drawn by the compositor.  The width
+   is in logical pixels, 0 means no border.  The rect is empty while the
+   frame has no border to show.  */
+@property (nonatomic, assign) int                         borderWidth;
+@property (nonatomic, assign) unsigned long               borderColor;
+@property (nonatomic, assign) NSRect                      borderRect;
+
 /* Translucency (alpha-background), refreshed at the start of each
    render cycle: the opacity, the GFX_BG_* kinds it applies to (bit
    mask) and the blur radius last applied to the window.  */
@@ -380,6 +387,11 @@ extern bool mtl_video_size (struct frame *f, double *w, double *h);
 /* Buffer-switch crossfade: snapshot current content, fade it out over
    DURATION seconds while the new content shows underneath. */
 extern bool mtl_transition_start (struct frame *f, float duration);
+
+/* Bring the selected-window border of F up to date.  Present F if the
+   border moved, or if FORCE and there is a border, unless a render cycle
+   is open.  */
+extern void mtl_update_window_border (struct frame *f, bool force);
 
 extern bool mtl_render_offscreen_png (const char *path, int w, int h,
                                        void (^draw)(id<MTLRenderCommandEncoder>));

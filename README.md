@@ -32,6 +32,9 @@ In order, oldest first:
   a stale cursor box behind, canvas images update after
   `canvas-refresh`, a black cursor keeps its color, and
   `ns-alpha-default` applies behind text.
+- **Metal: draw a border around the selected window**:
+  the selected window of the focused frame is outlined, see
+  `gpu-window-border-width` and `gpu-window-border-color`.
 
 ## Building
 
@@ -97,7 +100,9 @@ gpu` lists the options.  For example:
 ```elisp
 (with-eval-after-load 'gpu
   (setopt gpu-cursor-animation 'smear
-          gpu-cursor-effects-while-typing t))
+          gpu-cursor-effects-while-typing t
+          gpu-window-border-width 2       ; nil for no border
+          gpu-window-border-color 'link)) ; a face or a color name
 
 ;; Translucent, blurred background with opaque text.
 (add-to-list 'default-frame-alist '(alpha-background . 0.8))

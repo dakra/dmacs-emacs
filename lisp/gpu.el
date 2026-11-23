@@ -343,6 +343,12 @@ The NS backend still handles events, menus, and scrollbars."
     ;; so wire the watcher whenever it is available.
     (when (fboundp 'gpu-transition-start)
       (add-hook 'pre-redisplay-functions #'gpu--transition-watch))
+    (when (fboundp 'gpu-selected-window-border)
+      (add-function :after after-focus-change-function
+                    #'gpu--update-window-border)
+      (add-hook 'enable-theme-functions #'gpu--update-window-border)
+      (add-hook 'disable-theme-functions #'gpu--update-window-border)
+      (gpu--update-window-border))
     ;; Cursor effects, scroll easing and the animation layer; apply only
     ;; when the backend exposes their primitives (Metal and OpenGL both do).
     (if (fboundp 'gpu-cursor-mode)
@@ -412,6 +418,47 @@ The NS backend still handles events, menus, and scrollbars."
                                     "ease-out-cubic" "spring" "ease-in-out-cubic")
                                   nil t))))
   (setopt gpu-scroll-easing easing))
+
+;; ---------------------------------------------------------------------------
+;; Selected-window border
+
+(declare-function gpu-selected-window-border "mtlfns.m" (frame width color))
+
+(defun gpu--set-window-border (symbol value)
+  "Set SYMBOL to VALUE and update the selected-window border."
+  (set-default symbol value)
+  (gpu--update-window-border))
+
+(defcustom gpu-window-border-width 2
+  "Width in pixels of the border around the selected window, or nil for none.
+The border is drawn over the edge of the window, and only in the frame
+that has the input focus."
+  :type '(choice (const :tag "No border" nil)
+                 (natnum :tag "Pixels"))
+  :initialize #'custom-initialize-default
+  :set #'gpu--set-window-border
+  :group 'gpu)
+
+(defcustom gpu-window-border-color 'link
+  "Color of the border around the selected window.
+The value is either a color name or a face whose foreground is used."
+  :type '(choice (face :tag "Foreground of face")
+                 (color :tag "Color"))
+  :initialize #'custom-initialize-default
+  :set #'gpu--set-window-border
+  :group 'gpu)
+
+(defun gpu--update-window-border (&rest _)
+  "Apply the selected-window border options to all GPU frames."
+  (when (fboundp 'gpu-selected-window-border)
+    (dolist (frame (frame-list))
+      (when (display-graphic-p frame)
+        (with-demoted-errors "GPU window border: %S"
+          (gpu-selected-window-border
+           frame gpu-window-border-width
+           (if (symbolp gpu-window-border-color)
+               (face-foreground gpu-window-border-color frame 'default)
+             gpu-window-border-color)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Buffer-switch transitions
